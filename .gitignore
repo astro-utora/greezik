@@ -1,0 +1,21 @@
+# Secrets / local config
+.env
+
+# Persistent Playwright profile
+.pw_profile/
+
+# Bot output
+applied_jobs.jsonl
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env.local
+
+# IDE
+.vscode/
+.idea/
