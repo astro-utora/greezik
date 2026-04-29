@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import (
     BrowserContext,
@@ -16,10 +17,19 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-from . import selectors
-from .storage import AppliedURLStore
+from . import autobid as autobid_mod
+from . import notifications, selectors
+from .ai_answer import AIAnswerer
+from .profile import ApplicantProfile
+from .storage import AppliedURLStore, SkippedURLStore
 
 logger = logging.getLogger(__name__)
+
+
+# Domain that signals "this URL is a Greenhouse application form we can
+# autofill". Anything else is a portal we don't have a filler for; we
+# log it to ``skipped_jobs.jsonl`` and move on.
+_GREENHOUSE_HOST_NEEDLE = "job-boards.greenhouse.io"
 
 
 @dataclass
@@ -28,6 +38,8 @@ class ApplyStats:
     duplicates: int = 0
     skipped: int = 0
     modals_dismissed: int = 0
+    submitted: int = 0
+    autobid_failed: int = 0
 
 
 def run_apply_loop(
@@ -36,11 +48,33 @@ def run_apply_loop(
     store: AppliedURLStore,
     *,
     action_timeout_ms: int,
+    skipped_store: SkippedURLStore | None = None,
+    profile: ApplicantProfile | None = None,
+    ai: AIAnswerer | None = None,
+    submit_greenhouse: bool = True,
+    company_dedup_days: int = 3,
 ) -> ApplyStats:
-    """Click Apply buttons until none remain, saving each external URL.
+    """Click Apply buttons until none remain.
+
+    For each external URL we open we route as follows:
+
+    * **Greenhouse** (``job-boards.greenhouse.io``) -- run :mod:`autobid`
+      against the popup. On a confirmed/verified submit, record to
+      ``applied_jobs.jsonl``. On a judge-SKIP, dedup-skip, or user-
+      dismissed submit failure, record to ``skipped_jobs.jsonl``.
+    * **Anything else** -- save to ``skipped_jobs.jsonl`` with reason
+      ``"not_greenhouse"`` and close the tab.
 
     The page is expected to already be on /jobs/recommend.
     """
+
+    if skipped_store is None:
+        # Make the new path opt-in: callers that haven't yet been
+        # updated still get the old behaviour (URL-only capture).
+        logger.warning(
+            "run_apply_loop called without a SkippedURLStore -- "
+            "skipped jobs will not be persisted."
+        )
 
     stats = ApplyStats()
     iteration = 0
@@ -105,30 +139,74 @@ def run_apply_loop(
 
         consecutive_failures = 0
 
-        # GUARANTEE the popup tab is closed even if URL capture throws --
-        # otherwise unreachable / errored apply pages would pile up as open
-        # tabs in the persistent Chromium profile.
+        # GUARANTEE the popup tab is closed even if URL capture / autobid
+        # throws -- otherwise unreachable / errored apply pages would
+        # pile up as open tabs in the persistent Chromium profile.
+        outcome: _PopupOutcome
         try:
             url = _capture_popup_url(popup, action_timeout_ms=action_timeout_ms)
+            if url is None:
+                outcome = _PopupOutcome(kind="unreachable", url="")
+            else:
+                outcome = _handle_popup_for_url(
+                    popup,
+                    url,
+                    iteration=iteration,
+                    store=store,
+                    skipped_store=skipped_store,
+                    profile=profile,
+                    ai=ai,
+                    submit_greenhouse=submit_greenhouse,
+                    company_dedup_days=company_dedup_days,
+                    action_timeout_ms=action_timeout_ms,
+                )
         finally:
             _safe_close(popup)
 
-        if url is None:
+        # Translate the popup outcome into stats + debug logging.
+        if outcome.kind == "unreachable":
             logger.warning(
                 "Could not reach the apply URL; popup closed, continuing."
             )
             stats.skipped += 1
-        else:
-            stored = store.add(url)
-            if stored:
-                stats.captured += 1
-                logger.info("Captured apply URL #%d: %s", stats.captured, url)
-            else:
-                stats.duplicates += 1
-                logger.info("Duplicate URL (already saved): %s", url)
-                # If we got the same URL twice, the previous confirmation
-                # didn't actually advance the feed. Snapshot for diagnosis.
-                _save_debug_screenshot(page, f"duplicate_url_iter{iteration}")
+        elif outcome.kind == "duplicate_url":
+            stats.duplicates += 1
+            logger.info("Duplicate URL (already saved): %s", outcome.url)
+            _save_debug_screenshot(page, f"duplicate_url_iter{iteration}")
+        elif outcome.kind == "applied":
+            stats.captured += 1
+            stats.submitted += 1
+            logger.info(
+                "Captured + submitted apply #%d: %s @ %s [%s]",
+                stats.captured,
+                outcome.role or "?",
+                outcome.company or "?",
+                outcome.url,
+            )
+        elif outcome.kind == "manual_applied":
+            stats.captured += 1
+            logger.info(
+                "Recorded manual apply #%d (user finished form): %s @ %s [%s]",
+                stats.captured,
+                outcome.role or "?",
+                outcome.company or "?",
+                outcome.url,
+            )
+        elif outcome.kind == "skipped":
+            stats.skipped += 1
+            logger.info(
+                "Skipped apply (%s): %s",
+                outcome.skip_reason or "unspecified",
+                outcome.url,
+            )
+        elif outcome.kind == "autobid_failed":
+            stats.skipped += 1
+            stats.autobid_failed += 1
+            logger.warning(
+                "Autobid failed; logged as skipped (%s): %s",
+                outcome.skip_reason or "autobid_error",
+                outcome.url,
+            )
 
         # An unwanted modal can also pop up between the popup closing and
         # the Yes-I-applied confirmation appearing, blocking the click.
@@ -145,6 +223,283 @@ def run_apply_loop(
         _wait_for_feed_settle(page, timeout_ms=4_000)
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Per-popup routing: Greenhouse autobid vs. skip
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PopupOutcome:
+    """Internal result of handling one apply popup.
+
+    ``kind`` drives the stats + logging in :func:`run_apply_loop`:
+
+    * ``unreachable``    -- popup never loaded a real URL.
+    * ``duplicate_url``  -- this exact URL was already on file.
+    * ``applied``        -- Greenhouse form submitted by autobid.
+    * ``manual_applied`` -- autobid couldn't submit but user clicked
+                            OK on the manual-apply alert (they did it).
+    * ``skipped``        -- non-Greenhouse, judge SKIP, dedup, or
+                            user-cancelled manual alert.
+    * ``autobid_failed`` -- autobid raised an unexpected exception.
+    """
+
+    kind: str
+    url: str
+    role: str = ""
+    company: str = ""
+    skip_reason: str = ""
+
+
+def _handle_popup_for_url(
+    popup: Page,
+    url: str,
+    *,
+    iteration: int,
+    store: AppliedURLStore,
+    skipped_store: SkippedURLStore | None,
+    profile: ApplicantProfile | None,
+    ai: AIAnswerer | None,
+    submit_greenhouse: bool,
+    company_dedup_days: int,
+    action_timeout_ms: int,
+) -> _PopupOutcome:
+    """Dispatch a popup to autobid (Greenhouse) or skip-store (other).
+
+    Always returns -- the caller closes the popup in its ``finally``
+    regardless of what happens here. Exceptions inside autobid are
+    caught so a single bad form doesn't abort the whole feed loop.
+    """
+
+    if store.has(url):
+        return _PopupOutcome(kind="duplicate_url", url=url)
+
+    host = ""
+    try:
+        host = (urlsplit(url).netloc or "").lower()
+    except ValueError:
+        host = ""
+
+    is_greenhouse = _GREENHOUSE_HOST_NEEDLE in host
+
+    if not is_greenhouse:
+        # Non-Greenhouse portal: we don't have an autofill for it.
+        # Log it to skipped_jobs.jsonl and let the human chase it.
+        if skipped_store is not None:
+            skipped_store.add(
+                url,
+                skip_reason="not_greenhouse",
+                provider=host or "unknown",
+            )
+        logger.info("Non-Greenhouse apply portal (%s); skipping.", host or url)
+        return _PopupOutcome(
+            kind="skipped",
+            url=url,
+            skip_reason="not_greenhouse",
+        )
+
+    # 1. Per-company dedup window -- run BEFORE autobid so a duplicate
+    #    company never even reaches the form fill / submit step. The
+    #    Greenhouse company slug lives in the URL's ``?for=...`` param,
+    #    so we don't need to load the page to know who's hiring.
+    early_slug = autobid_mod.extract_company_slug_from_url(url)
+    if (
+        early_slug
+        and store.applied_to_company_within(early_slug, company_dedup_days)
+    ):
+        last = store.last_applied_to_company(early_slug)
+        reason = (
+            f"already_applied_within_{company_dedup_days}d"
+            f" (last={last.isoformat() if last else 'unknown'})"
+        )
+        if skipped_store is not None:
+            skipped_store.add(
+                url,
+                skip_reason=reason,
+                provider="greenhouse",
+                company_slug=early_slug,
+            )
+        logger.info(
+            "Already applied to %r within last %d day(s); skipping "
+            "before autobid runs.",
+            early_slug,
+            company_dedup_days,
+        )
+        return _PopupOutcome(
+            kind="skipped",
+            url=url,
+            company=early_slug,
+            skip_reason=reason,
+        )
+
+    # Greenhouse path. autobid wants the popup tab as its ``Page`` and
+    # a fully-built ApplicantProfile + AIAnswerer.
+    if profile is None:
+        # Without a profile we can't safely fill anything; degrade to
+        # capture-only so we don't drop the URL on the floor.
+        store.add(url, provider="greenhouse")
+        return _PopupOutcome(
+            kind="applied",
+            url=url,
+        )
+
+    try:
+        result = autobid_mod.autobid_apply(
+            popup,
+            profile,
+            ai,
+            submit=submit_greenhouse,
+            action_timeout_ms=action_timeout_ms,
+        )
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        logger.exception("Autobid raised on iteration %d: %s", iteration, exc)
+        if skipped_store is not None:
+            skipped_store.add(
+                url,
+                skip_reason=f"autobid_exception: {exc.__class__.__name__}",
+                provider="greenhouse",
+                company_slug=early_slug,
+            )
+        return _PopupOutcome(
+            kind="autobid_failed",
+            url=url,
+            skip_reason=str(exc),
+        )
+
+    role = result.role_title or ""
+    company = result.company_name or ""
+    slug = result.company_slug or early_slug
+
+    # 2. Judge SKIP (low fit, blacklisted role, etc.).
+    if result.skip_reason is not None:
+        reason = f"judge_skip: {result.skip_reason}"
+        if skipped_store is not None:
+            skipped_store.add(
+                url,
+                skip_reason=reason,
+                provider="greenhouse",
+                company_slug=slug,
+                company_name=company,
+                role_title=role,
+            )
+        return _PopupOutcome(
+            kind="skipped",
+            url=url,
+            role=role,
+            company=company or slug,
+            skip_reason=reason,
+        )
+
+    # 3. Submission outcome.
+    status = result.submission_status
+    if status in ("confirmed", "verified"):
+        store.add(
+            url,
+            company_slug=slug,
+            company_name=company,
+            role_title=role,
+            provider="greenhouse",
+            submission_status=status,
+            resume_used=(
+                result.resume_used.name if result.resume_used else ""
+            ),
+        )
+        return _PopupOutcome(
+            kind="applied",
+            url=url,
+            role=role,
+            company=company or slug,
+        )
+
+    if status == "not_attempted":
+        # ``submit_greenhouse=False`` dry-run path. Treat as captured
+        # so the same URL doesn't loop, but tag it so the human sees
+        # the form was filled-only.
+        store.add(
+            url,
+            company_slug=slug,
+            company_name=company,
+            role_title=role,
+            provider="greenhouse",
+            submission_status="filled_only",
+            resume_used=(
+                result.resume_used.name if result.resume_used else ""
+            ),
+        )
+        return _PopupOutcome(
+            kind="applied",
+            url=url,
+            role=role,
+            company=company or slug,
+        )
+
+    # 4. Submit failed -- ask the human.
+    head = _submit_failure_head(status)
+    detail_lines = list(result.submission_errors[:5])
+    if result.error and result.error not in detail_lines:
+        detail_lines.insert(0, result.error)
+    user_finished = notifications.manual_apply_alert(
+        role=role,
+        company=company or slug,
+        url=url,
+        head=head,
+        detail_lines=detail_lines,
+    )
+    if user_finished:
+        store.add(
+            url,
+            company_slug=slug,
+            company_name=company,
+            role_title=role,
+            provider="greenhouse",
+            submission_status="manual",
+            resume_used=(
+                result.resume_used.name if result.resume_used else ""
+            ),
+        )
+        return _PopupOutcome(
+            kind="manual_applied",
+            url=url,
+            role=role,
+            company=company or slug,
+        )
+
+    # User clicked Cancel -> record as skipped.
+    reason = f"submit_failed_user_skipped: {status}"
+    if skipped_store is not None:
+        skipped_store.add(
+            url,
+            skip_reason=reason,
+            provider="greenhouse",
+            company_slug=slug,
+            company_name=company,
+            role_title=role,
+        )
+    return _PopupOutcome(
+        kind="skipped",
+        url=url,
+        role=role,
+        company=company or slug,
+        skip_reason=reason,
+    )
+
+
+def _submit_failure_head(status: str) -> str:
+    if status == "needs_code_failed":
+        return (
+            "Greenhouse asked for an email verification code, but Greezik "
+            "couldn't paste a valid one back."
+        )
+    if status == "form_error":
+        return "Greenhouse rejected the submit -- visible field errors on the form."
+    if status == "no_change":
+        return (
+            "Submit click had no visible effect -- the form may have failed "
+            "silently."
+        )
+    return f"Submit outcome: {status}"
 
 
 # ---------------------------------------------------------------------------

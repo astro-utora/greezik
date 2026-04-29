@@ -4,8 +4,11 @@
 # Persistent Playwright profile
 .pw_profile/
 
+.cache/
+
 # Bot output
 applied_jobs.jsonl
+skipped_jobs.jsonl
 logs/
 
 # Python

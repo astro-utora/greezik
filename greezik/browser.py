@@ -8,6 +8,8 @@ from typing import Iterator
 
 from playwright.sync_api import BrowserContext, Playwright, sync_playwright
 
+from .config import ProxyConfig
+
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -22,6 +24,7 @@ def launch_browser(
     *,
     headless: bool = False,
     action_timeout_ms: int = 15_000,
+    proxy: ProxyConfig | None = None,
 ) -> Iterator[BrowserContext]:
     """Launch a persistent Chromium context and yield it.
 
@@ -32,7 +35,7 @@ def launch_browser(
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as pw:
-        context = _launch(pw, profile_dir, headless=headless)
+        context = _launch(pw, profile_dir, headless=headless, proxy=proxy)
         context.set_default_timeout(action_timeout_ms)
         context.set_default_navigation_timeout(max(action_timeout_ms, 30_000))
         try:
@@ -44,7 +47,13 @@ def launch_browser(
                 pass
 
 
-def _launch(pw: Playwright, profile_dir: Path, *, headless: bool) -> BrowserContext:
+def _launch(
+    pw: Playwright,
+    profile_dir: Path,
+    *,
+    headless: bool,
+    proxy: ProxyConfig | None,
+) -> BrowserContext:
     return pw.chromium.launch_persistent_context(
         user_data_dir=str(profile_dir),
         headless=headless,
@@ -55,4 +64,5 @@ def _launch(pw: Playwright, profile_dir: Path, *, headless: bool) -> BrowserCont
             "--disable-features=IsolateOrigins,site-per-process",
         ],
         ignore_default_args=["--enable-automation"],
+        proxy=proxy.to_playwright() if proxy else None,
     )
