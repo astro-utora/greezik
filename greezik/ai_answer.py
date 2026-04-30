@@ -94,6 +94,11 @@ class AIAnswerer:
         # applying for. Cleared between jobs because cached answers
         # are tied to the JD that was active when they were generated.
         self._job_description: str = ""
+        # Per-job company-summary blurb scraped from jobright (when
+        # available). Used as additional prompt grounding so generated
+        # answers reflect the employer's mission / domain. Like
+        # ``job_description``, changing it clears the cache.
+        self._company_summary: str = ""
 
     @property
     def profile(self) -> ApplicantProfile:
@@ -140,6 +145,24 @@ class AIAnswerer:
             self.api_calls = 0
             self.cache_hits = 0
         self._job_description = new_value
+
+    @property
+    def company_summary(self) -> str:
+        return self._company_summary
+
+    @company_summary.setter
+    def company_summary(self, value: str) -> None:
+        """Set the per-job company-summary text. Like
+        ``job_description``, switching to a different summary clears
+        the answer cache so cached answers grounded in the previous
+        company don't bleed into the new one.
+        """
+
+        new_value = (value or "").strip()
+        if new_value != self._company_summary:
+            self._cache.clear()
+            self.distinct_served.clear()
+        self._company_summary = new_value
 
     @classmethod
     def from_env(
@@ -479,6 +502,19 @@ class AIAnswerer:
         else:
             resume_block = ""
 
+        company_summary = self._company_summary
+        if company_summary:
+            company_block = (
+                "COMPANY SUMMARY (a short blurb about the employer; use "
+                "to set tone and naturally reference the company's "
+                "mission / domain when relevant -- never invent extra "
+                "facts not present here):\n"
+                + company_summary
+                + "\n\n"
+            )
+        else:
+            company_block = ""
+
         jd = self._job_description
         if jd:
             jd_block = (
@@ -569,6 +605,7 @@ class AIAnswerer:
             f"- Location: {location}\n"
             f"- Summary: {self.profile.summary or '(no summary provided)'}\n\n"
             f"{resume_block}"
+            f"{company_block}"
             f"{jd_block}"
             f"QUESTIONS ({len(items)}):\n\n"
             f"{questions_block}\n\n"
@@ -610,6 +647,19 @@ class AIAnswerer:
         else:
             resume_block = ""
 
+        company_summary = self._company_summary
+        if company_summary:
+            company_summary_block = (
+                "COMPANY SUMMARY (a short blurb about the employer; use "
+                "to set tone and naturally reference the company's "
+                "mission / domain when relevant -- never invent extra "
+                "facts not present here):\n"
+                + company_summary
+                + "\n"
+            )
+        else:
+            company_summary_block = ""
+
         jd = self._job_description
         if jd:
             jd_block = (
@@ -623,41 +673,31 @@ class AIAnswerer:
         else:
             jd_block = ""
 
+        format_kwargs: dict[str, str] = dict(
+            full_name=self.profile.full_name or "Candidate",
+            email=self.profile.email or "n/a",
+            linkedin=self.profile.linkedin or "n/a",
+            location=location,
+            summary=self.profile.summary or "(no summary provided)",
+            resume=resume_text or "(no resume text available)",
+            resume_block=resume_block,
+            company_summary=company_summary or "(no company summary available)",
+            company_summary_block=company_summary_block,
+            job_description=jd or "(no job description available)",
+            job_description_block=jd_block,
+            label=ctx.label or ctx.question,
+            question=ctx.question,
+            options_block=options_block,
+        )
         try:
-            return self.prompt_template.format(
-                full_name=self.profile.full_name or "Candidate",
-                email=self.profile.email or "n/a",
-                linkedin=self.profile.linkedin or "n/a",
-                location=location,
-                summary=self.profile.summary or "(no summary provided)",
-                resume=resume_text or "(no resume text available)",
-                resume_block=resume_block,
-                job_description=jd or "(no job description available)",
-                job_description_block=jd_block,
-                label=ctx.label or ctx.question,
-                question=ctx.question,
-                options_block=options_block,
-            )
+            return self.prompt_template.format(**format_kwargs)
         except KeyError as exc:
             logger.warning(
                 "AI prompt template references unknown placeholder %s; "
                 "falling back to default.",
                 exc,
             )
-            return _DEFAULT_PROMPT.format(
-                full_name=self.profile.full_name or "Candidate",
-                email=self.profile.email or "n/a",
-                linkedin=self.profile.linkedin or "n/a",
-                location=location,
-                summary=self.profile.summary or "",
-                resume=resume_text or "(no resume text available)",
-                resume_block=resume_block,
-                job_description=jd or "(no job description available)",
-                job_description_block=jd_block,
-                label=ctx.label or ctx.question,
-                question=ctx.question,
-                options_block=options_block,
-            )
+            return _DEFAULT_PROMPT.format(**format_kwargs)
 
 
 _DEFAULT_PROMPT = """\
@@ -673,6 +713,7 @@ CANDIDATE:
 - Summary: {summary}
 
 {resume_block}
+{company_summary_block}
 {job_description_block}
 QUESTION (label = "{label}"):
 {question}

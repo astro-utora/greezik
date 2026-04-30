@@ -1,17 +1,29 @@
-"""Logging setup for Greezik."""
+"""Logging setup for Greezik.
+
+Console-only. The ``logs/`` tree on disk is reserved for per-run JSONL
+data files under ``logs/jobright/`` (applied / skipped /
+manual-required); we deliberately do NOT write a rotating
+``greezik.log`` text file. Long-form post-mortems should rely on the
+shell/terminal capture or be saved out by the user explicitly.
+"""
 
 from __future__ import annotations
 
 import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
-def setup_logging(log_dir: Path | None = None, level: int = logging.INFO) -> logging.Logger:
-    """Configure root logger with console + rotating file handlers.
+def setup_logging(
+    log_dir: Path | None = None,  # noqa: ARG001  -- kept for ABI compatibility
+    level: int = logging.INFO,
+) -> logging.Logger:
+    """Configure the root logger with a single console handler.
 
-    Returns the root logger for convenience. Calling this more than once is
-    safe; it will reset existing handlers so reruns don't accumulate them.
+    Returns the root logger for convenience. Calling this more than
+    once is safe; existing handlers are removed first so reruns don't
+    accumulate them. The ``log_dir`` parameter is accepted for
+    backwards compatibility with older callers but is ignored -- file
+    logging is intentionally disabled.
     """
 
     root = logging.getLogger()
@@ -29,19 +41,6 @@ def setup_logging(log_dir: Path | None = None, level: int = logging.INFO) -> log
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    target_dir = log_dir or (Path.cwd() / "logs")
-    target_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(
-        target_dir / "greezik.log",
-        maxBytes=2_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
-
-    # Quiet noisy libraries.
     logging.getLogger("playwright").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 

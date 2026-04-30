@@ -6,7 +6,7 @@ Length guidance:
 - Standard short-answer question: 2-4 sentences.
 - Cover-letter-style / "tell us why you're a fit" question: 4-7 sentences, no fluff.
 
-Ground every answer in the CANDIDATE RESUME below. Tailor every answer to the JOB DESCRIPTION below: highlight the candidate's experiences, technologies, and impact that are most relevant to this specific role's responsibilities and requirements. Prefer concrete experiences, projects, employers, technologies, and dates from the resume over generic statements. If the question asks for something the resume doesn't cover (e.g. specific years of experience in a niche tool, salary expectation), pick a reasonable, conservative answer that does not disqualify the candidate, and avoid fabricating employers or dates that contradict the resume.
+Ground every answer in the CANDIDATE RESUME below. Tailor every answer to the JOB DESCRIPTION below: highlight the candidate's experiences, technologies, and impact that are most relevant to this specific role's responsibilities and requirements. When a COMPANY SUMMARY is provided, naturally weave the employer's mission / domain into "why this company?" style answers without inventing extra facts that aren't in the summary. Prefer concrete experiences, projects, employers, technologies, and dates from the resume over generic statements. If the question asks for something the resume doesn't cover (e.g. specific years of experience in a niche tool, salary expectation), pick a reasonable, conservative answer that does not disqualify the candidate, and avoid fabricating employers or dates that contradict the resume.
 
 CANDIDATE PREFERENCES (treat these as authoritative; never contradict them):
 - Availability: 40 hours per week, full-time.
@@ -29,6 +29,7 @@ CANDIDATE PROFILE:
 - Summary: {summary}
 
 {resume_block}
+{company_summary_block}
 {job_description_block}
 QUESTION (label = "{label}"):
 {question}

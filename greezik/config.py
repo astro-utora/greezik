@@ -39,18 +39,42 @@ class Config:
     redirect_wait_seconds: float
     applied_urls_file: Path
     skipped_urls_file: Path
+    manual_required_file: Path
     browser_profile_dir: Path
     action_timeout_ms: int
     proxy: ProxyConfig | None = None
     # Per-company dedup window. If we've already applied to this
     # company within ``company_dedup_days`` days, the new opening is
-    # logged to ``skipped_jobs.jsonl`` and not re-bid. Set to 0 to
-    # disable.
+    # logged to the configured skipped-URLs file and not re-bid. Set
+    # to 0 to disable.
     company_dedup_days: int = 3
+    # On startup, drop records older than this from
+    # ``applied_urls_file`` so the log doesn't grow unbounded across
+    # runs. Set to 0 to disable pruning entirely.
+    applied_log_retention_days: int = 30
     # When True, the live runner actually clicks "Submit application"
     # on Greenhouse forms. When False, the form is filled but left
     # open for manual review.
     submit_greenhouse: bool = True
+    # When True (default), a Windows MessageBox is popped for every
+    # Greenhouse submit that does not confirm so the user can decide
+    # whether to finish the application manually. When False, the
+    # bot logs the failed job to ``manual_required_file`` and quietly
+    # moves on -- useful for unattended overnight runs.
+    manual_apply_alert: bool = True
+    # When True, Chromium is launched without a UI window
+    # (true headless). When False (default) the persistent
+    # ``.pw_profile`` is opened headful so the user can watch the
+    # bot work and intervene if needed.
+    browser_headless: bool = False
+    # Threshold for the ``backfill`` subcommand: stop iterating the
+    # /jobs/applied feed when the next card's publish time is older
+    # than this. Format is ``<int><unit>`` where unit is one of
+    # ``s/sec``, ``min`` (minutes), ``h/hr``, ``d``, ``w``, ``m/mo``
+    # (months), ``y``. The bare letter ``m`` is interpreted as
+    # **months** (so ``5m`` -> 5 months, matching jobright's
+    # publish-time tag). Use ``min`` for minutes.
+    backfill_stop_after: str = "1w"
 
     @property
     def action_timeout_seconds(self) -> float:
@@ -172,13 +196,23 @@ def load_config(project_root: Path | None = None) -> Config:
     if not profile_dir.is_absolute():
         profile_dir = root / profile_dir
 
-    applied_file = Path(_get_str("APPLIED_URLS_FILE", "applied_jobs.jsonl"))
+    applied_file = Path(
+        _get_str("APPLIED_URLS_FILE", "logs/jobright/big_log.jsonl")
+    )
     if not applied_file.is_absolute():
         applied_file = root / applied_file
 
-    skipped_file = Path(_get_str("SKIPPED_URLS_FILE", "skipped_jobs.jsonl"))
+    skipped_file = Path(
+        _get_str("SKIPPED_URLS_FILE", "logs/jobright/skipped_urls.jsonl")
+    )
     if not skipped_file.is_absolute():
         skipped_file = root / skipped_file
+
+    manual_required_file = Path(
+        _get_str("MANUAL_REQUIRED_FILE", "logs/jobright/manual_required.jsonl")
+    )
+    if not manual_required_file.is_absolute():
+        manual_required_file = root / manual_required_file
 
     proxy = _parse_proxy(_get_str("BROWSER_PROXY", ""))
     if proxy is not None:
@@ -192,9 +226,14 @@ def load_config(project_root: Path | None = None) -> Config:
         redirect_wait_seconds=_get_float("REDIRECT_WAIT_SECONDS", 30.0),
         applied_urls_file=applied_file,
         skipped_urls_file=skipped_file,
+        manual_required_file=manual_required_file,
         browser_profile_dir=profile_dir,
         action_timeout_ms=_get_int("ACTION_TIMEOUT_MS", 15_000),
         proxy=proxy,
         company_dedup_days=_get_int("COMPANY_DEDUP_DAYS", 3),
+        applied_log_retention_days=_get_int("APPLIED_LOG_RETENTION_DAYS", 30),
         submit_greenhouse=_get_bool("SUBMIT_GREENHOUSE", True),
+        manual_apply_alert=_get_bool("MANUAL_APPLY_ALERT", True),
+        browser_headless=_get_bool("BROWSER_HEADLESS", False),
+        backfill_stop_after=_get_str("BACKFILL_STOP_AFTER", "1w"),
     )

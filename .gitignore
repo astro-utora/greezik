@@ -4,12 +4,15 @@
 # Persistent Playwright profile
 .pw_profile/
 
-.cache/
-
-# Bot output
-applied_jobs.jsonl
-skipped_jobs.jsonl
+# Bot output (applied / skipped / manual-required JSONL logs default
+# to logs/jobright/, so the broad logs/ ignore covers them).
 logs/
+bid/
+
+# Vendored cache files written by steps/* (keyed on local DOCX
+# mtimes, not portable, regenerated on every run).
+steps/_resume_cache.json
+steps/_judge_vocab_cache.json
 
 # Python
 __pycache__/

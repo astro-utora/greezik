@@ -62,16 +62,25 @@ class ApplicantProfile:
     education_start_month: str = ""
     education_end_month: str = ""
 
-    # Resume file (absolute path or relative to project root) and its
-    # extracted plain-text content, used to ground AI-generated answers
-    # in the candidate's actual experience.
+    # Resume the per-job matcher picked for the current application.
+    # ALWAYS ``None`` on the freshly-loaded profile; populated only
+    # by ``autobid._select_resume_for_job`` once a JD is available
+    # (and only when the JD passes the judge AND the matcher returns
+    # a usable candidate from ``resumes_dir``). Used by the
+    # Greenhouse upload step and by the AI prompt template
+    # (``{candidate_resume}``).
     resume_path: Path | None = None
+    # Plain-text content of ``resume_path``, used by the AI prompt
+    # to ground generated answers in the candidate's actual
+    # experience. Populated by ``autobid._select_resume_for_job``
+    # when the matcher picks a resume.
     resume_text: str = ""
-    # OPTIONAL: folder of candidate resumes used by the per-job
-    # judge/match pipeline. When set, the autobid scores every PDF
-    # against the JD and uploads the best match instead of
-    # ``resume_path``. ``resume_path`` is still used as the fallback
-    # if the matcher fails / is disabled.
+    # REQUIRED: folder containing the candidate's DOCX/PDF resume
+    # pairs. The per-job matcher scores every DOCX against the JD
+    # and uploads the paired PDF for the best match. If this is
+    # ``None`` (env var unset or pointing at a missing path), the
+    # autobid records every job as skipped because there is no
+    # resume to upload.
     resumes_dir: Path | None = None
 
     # Voluntary self-identification (Greenhouse dropdown labels)
@@ -138,14 +147,6 @@ def load_profile(project_root: Path | None = None) -> ApplicantProfile:
         value = os.getenv(name)
         return value.strip() if value else default
 
-    resume_raw = env("APPLICANT_RESUME_PATH")
-    if resume_raw:
-        resume_path: Path | None = Path(resume_raw)
-        if not resume_path.is_absolute():
-            resume_path = (root / resume_path).resolve()
-    else:
-        resume_path = None
-
     resumes_dir_raw = env("APPLICANT_RESUMES_DIR")
     if resumes_dir_raw:
         resumes_dir: Path | None = Path(resumes_dir_raw)
@@ -153,24 +154,19 @@ def load_profile(project_root: Path | None = None) -> ApplicantProfile:
             resumes_dir = (root / resumes_dir).resolve()
         if not resumes_dir.exists():
             logger.warning(
-                "APPLICANT_RESUMES_DIR=%s does not exist; per-job resume "
-                "matching disabled. The single APPLICANT_RESUME_PATH will "
-                "be used for every job.",
+                "APPLICANT_RESUMES_DIR=%s does not exist; the per-job "
+                "matcher has nothing to score against and every job will "
+                "be recorded as skipped.",
                 resumes_dir,
             )
             resumes_dir = None
     else:
+        logger.warning(
+            "APPLICANT_RESUMES_DIR is not set; the per-job matcher has "
+            "nothing to score against and every job will be recorded as "
+            "skipped. Point this at a folder of .docx/.pdf resume pairs."
+        )
         resumes_dir = None
-
-    resume_text = ""
-    if resume_path and resume_path.exists():
-        resume_text = _extract_resume_text(resume_path)
-        if resume_text:
-            logger.info(
-                "Loaded %d chars of resume text from %s for AI grounding.",
-                len(resume_text),
-                resume_path.name,
-            )
 
     profile = ApplicantProfile(
         first_name=env("APPLICANT_FIRST_NAME"),
@@ -194,8 +190,6 @@ def load_profile(project_root: Path | None = None) -> ApplicantProfile:
         education_end_year=env("APPLICANT_EDUCATION_END_YEAR"),
         education_start_month=env("APPLICANT_EDUCATION_START_MONTH"),
         education_end_month=env("APPLICANT_EDUCATION_END_MONTH"),
-        resume_path=resume_path,
-        resume_text=resume_text,
         resumes_dir=resumes_dir,
         gender=env("APPLICANT_GENDER"),
         hispanic_ethnicity=env("APPLICANT_HISPANIC_ETHNICITY"),

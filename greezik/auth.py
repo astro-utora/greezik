@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
-from pathlib import Path
 
 from playwright.sync_api import (
     Locator,
@@ -82,18 +80,13 @@ def ensure_signed_in(
             )
             trigger = _find_visible_sign_in_trigger(page)
             if trigger is None:
-                _save_debug_screenshot(page, "no_signin_no_recommend")
                 raise LoginError(
                     "Could not find /jobs/recommend nor a visible 'SIGN IN' "
                     "trigger after waiting. Current URL: " + page.url
                 )
 
     logger.info("Performing sign-in (trigger visible).")
-    try:
-        _perform_sign_in(page, trigger=trigger, email=email, password=password)
-    except Exception:
-        _save_debug_screenshot(page, "sign_in_failed")
-        raise
+    _perform_sign_in(page, trigger=trigger, email=email, password=password)
 
     try:
         page.wait_for_url(
@@ -101,7 +94,6 @@ def ensure_signed_in(
             timeout=int(redirect_wait_seconds * 1000),
         )
     except PlaywrightTimeoutError as exc:
-        _save_debug_screenshot(page, "sign_in_no_redirect")
         raise LoginError(
             "Timed out waiting for redirect to /jobs/recommend after sign-in. "
             "Check credentials, captcha, or 2FA."
@@ -168,13 +160,3 @@ def _find_visible_sign_in_trigger(page: Page) -> Locator | None:
     return None
 
 
-def _save_debug_screenshot(page: Page, label: str) -> None:
-    try:
-        out_dir = Path("logs")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = out_dir / f"{label}-{stamp}.png"
-        page.screenshot(path=str(path), full_page=True)
-        logger.warning("Saved debug screenshot to %s", path)
-    except Exception as exc:
-        logger.debug("Could not save debug screenshot: %s", exc)

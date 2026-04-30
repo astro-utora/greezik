@@ -1,7 +1,8 @@
 """Test CLI for the autobid module.
 
-Reads URLs from ``applied_jobs.jsonl`` (or any JSONL file passed via
-``--source``), filters to Greenhouse URLs by default, opens each in a fresh
+Reads URLs from the configured ``APPLIED_URLS_FILE`` (default
+``logs/jobright/big_log.jsonl``) -- or any JSONL file passed via
+``--source`` -- filters to Greenhouse URLs by default, opens each in a fresh
 Chromium tab, fills the form using your ``.env`` profile, and either leaves
 it open for manual review (default) or actually submits (``--submit``).
 
@@ -62,8 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Greezik autobid test runner")
     parser.add_argument(
         "--source",
-        default="applied_jobs.jsonl",
-        help="JSONL file with previously captured apply URLs (default: applied_jobs.jsonl).",
+        default=None,
+        help="JSONL file with previously captured apply URLs. Defaults to "
+        "the value of APPLIED_URLS_FILE in .env "
+        "(out-of-the-box: logs/jobright/big_log.jsonl).",
     )
     parser.add_argument(
         "--url",
@@ -145,10 +148,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    if profile.resume_path and not profile.resume_path.exists():
+    if profile.resumes_dir is None:
         logger.warning(
-            "APPLICANT_RESUME_PATH=%s does not exist; resume upload will be skipped.",
-            profile.resume_path,
+            "APPLICANT_RESUMES_DIR is not set or does not exist; the "
+            "per-job matcher will skip every job."
         )
 
     ai = AIAnswerer.from_env(profile, project_root=project_root)
@@ -158,9 +161,12 @@ def main(argv: list[str] | None = None) -> int:
         urls = list(args.url)
         logger.info("Using %d URL(s) from --url overrides.", len(urls))
     else:
-        source = Path(args.source)
-        if not source.is_absolute():
-            source = project_root / source
+        if args.source:
+            source = Path(args.source)
+            if not source.is_absolute():
+                source = project_root / source
+        else:
+            source = cfg.applied_urls_file
         all_urls = _read_jsonl_urls(source)
         urls = _filter_supported(all_urls)
         logger.info(

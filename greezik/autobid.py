@@ -22,6 +22,7 @@ import datetime as _dt
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,8 +95,10 @@ class AutobidResult:
     skip_reason: str | None = None
     judge_details: dict | None = None
     # Path of the resume that was actually uploaded for this job.
-    # Differs from ``profile.resume_path`` when the per-job matcher
-    # picked a better-fitting PDF from ``APPLICANT_RESUMES_DIR``.
+    # Set by the per-job matcher to the original PDF in
+    # ``APPLICANT_RESUMES_DIR`` (NOT the staged copy under
+    # ``bid/jobright/resume.pdf``) so the apply log captures which
+    # CV variant was scored highest.
     resume_used: Path | None = None
     # Local path where the captured JD was saved (for record-keeping
     # and for re-running the judge / matcher offline).
@@ -108,6 +111,12 @@ class AutobidResult:
     # autocomplete (e.g. Greenhouse's candidate-location field) on the
     # lazy-rendered second pass.
     _freeform_combo_ids: set[str] = field(default_factory=set, repr=False)
+    # If Greenhouse asked for an email verification code on this job,
+    # this holds the consumed Gmail message (code + IMAP UID + creds).
+    # Populated by ``_handle_security_code_prompt``; deleted by
+    # ``_fill_greenhouse`` only after ``submitted`` flips True. Typed
+    # as ``object`` to avoid an import cycle with ``email_verify``.
+    _verification_email: object | None = field(default=None, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -121,8 +130,22 @@ def autobid_apply(
     *,
     submit: bool = False,
     action_timeout_ms: int = 15_000,
+    jobright_jd_text: str | None = None,
+    jobright_company_summary: str = "",
+    jobright_role: str = "",
+    jobright_company: str = "",
+    jobright_bid_dir: Path | None = None,
 ) -> AutobidResult:
-    """Run the right autobid flow for the current ``page`` URL."""
+    """Run the right autobid flow for the current ``page`` URL.
+
+    ``jobright_*`` parameters are populated by the live runner once it
+    has scraped the jobright detail panel: when supplied, the
+    Greenhouse filler skips its own JD scraping / heuristic title
+    extraction, uses ``jobright_jd_text`` for the judge + matcher,
+    feeds ``jobright_company_summary`` into the AI prompt as extra
+    grounding, and copies the chosen resume to
+    ``jobright_bid_dir/resume.pdf`` for upload.
+    """
 
     url = page.url
     if "job-boards.greenhouse.io" in url:
@@ -132,6 +155,11 @@ def autobid_apply(
             ai,
             submit=submit,
             action_timeout_ms=action_timeout_ms,
+            jobright_jd_text=jobright_jd_text,
+            jobright_company_summary=jobright_company_summary,
+            jobright_role=jobright_role,
+            jobright_company=jobright_company,
+            jobright_bid_dir=jobright_bid_dir,
         )
     return AutobidResult(
         provider="unknown",
@@ -397,78 +425,23 @@ def _extract_job_description(page: Page) -> str:
 
 
 # ---------------------------------------------------------------------------
-# JD persistence (per-job .txt under logs/jds/)
+# Resume staging (copy the matched PDF to bid/jobright/resume.pdf)
 # ---------------------------------------------------------------------------
 
 
-_JD_DIR_NAME = Path("logs") / "jds"
-_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+def _stage_resume_at(src: Path, bid_dir: Path) -> Path:
+    """Copy ``src`` to ``bid_dir/resume.pdf`` and return the destination.
 
-
-def _safe_filename_part(value: str, max_len: int = 60) -> str:
-    """Sanitise a URL-derived string for use as a filename component."""
-    cleaned = _SAFE_NAME_RE.sub("-", value).strip("-")
-    return (cleaned or "job")[:max_len]
-
-
-def _build_jd_filename(url: str) -> str:
-    """Derive a stable filename from a Greenhouse job URL.
-
-    Greenhouse job-board URLs look like::
-
-        https://job-boards.greenhouse.io/embed/job_app
-            ?for=cordial81&jr_id=...&token=8483382002&utm_source=jobright
-
-    We extract ``for`` and ``jr_id`` (or ``token``) so the saved JD's
-    filename is recognisable and stable across runs of the same job.
+    Used by the live runner so every Greenhouse upload points at the
+    same well-known path (``bid/jobright/resume.pdf``) regardless of
+    which PDF in ``APPLICANT_RESUMES_DIR`` won the per-job matcher.
+    Raises :class:`OSError` if the copy fails so the caller can decide
+    whether to fall back to the original ``src``.
     """
-    parts = urlsplit(url)
-    qs = parse_qs(parts.query)
-    company = _safe_filename_part(qs.get("for", ["job"])[0])
-    ident = _safe_filename_part(
-        qs.get("jr_id", qs.get("token", [""]))[0] or "",
-        max_len=24,
-    )
-    timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    suffix = f"_{ident}" if ident else ""
-    return f"{company}{suffix}_{timestamp}.txt"
-
-
-def _save_job_description(
-    url: str,
-    title_hint: str,
-    jd_text: str,
-    *,
-    project_root: Path | None = None,
-) -> Path | None:
-    """Persist ``jd_text`` to ``logs/jds/<company>_<id>_<ts>.txt``.
-
-    The first line of the file is the source URL, the second the job
-    title hint (when known), then a blank line, then the JD verbatim.
-    Returns the path written, or ``None`` if writing failed (e.g. the
-    JD was empty or the disk was unwritable).
-    """
-    text = (jd_text or "").strip()
-    if not text:
-        return None
-    root = (project_root or Path.cwd()).resolve()
-    dest_dir = (root / _JD_DIR_NAME).resolve()
-    try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        logger.warning("Could not create JD directory %s: %s", dest_dir, exc)
-        return None
-    path = dest_dir / _build_jd_filename(url)
-    header = f"# URL: {url}\n"
-    if title_hint:
-        header += f"# Title: {title_hint}\n"
-    header += "\n"
-    try:
-        path.write_text(header + text, encoding="utf-8")
-    except OSError as exc:
-        logger.warning("Could not save JD to %s: %s", path, exc)
-        return None
-    return path
+    bid_dir.mkdir(parents=True, exist_ok=True)
+    dest = bid_dir / "resume.pdf"
+    shutil.copyfile(src, dest)
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -481,29 +454,38 @@ def _select_resume_for_job(
     jd_text: str,
     result: AutobidResult,
 ) -> ApplicantProfile:
-    """If ``profile.resumes_dir`` is set and the JD passes the judge,
-    swap the resume in ``profile`` to the best-matching PDF for this
-    JD. Otherwise return the profile unchanged.
+    """Run the JD judge + resume matcher for the current job.
 
-    The result's ``skip_reason`` / ``judge_details`` / ``resume_used``
-    fields are populated as side effects.
+    On success, returns a profile with ``resume_path`` / ``resume_text``
+    pointing at the best-matching PDF in ``APPLICANT_RESUMES_DIR``.
+    On any failure -- empty ``resumes_dir``, missing JD, judge SKIP,
+    or matcher returns no usable candidate -- ``result.skip_reason``
+    is set so the caller short-circuits the form fill (no resume
+    upload happens). ``result.judge_details`` and ``result.resume_used``
+    are populated as side effects.
     """
     if profile.resumes_dir is None:
-        result.resume_used = profile.resume_path
+        result.skip_reason = "no_resumes_dir"
+        logger.warning(
+            "APPLICANT_RESUMES_DIR is not set; cannot pick a resume for "
+            "this job. Recording it as skipped."
+        )
         return profile
     if not jd_text.strip():
-        # No JD captured -- the matcher would score every resume the
-        # same way, so skip selection and use the configured default.
-        logger.info(
-            "No job description captured; per-job resume matching skipped, "
-            "falling back to APPLICANT_RESUME_PATH."
+        result.skip_reason = "no_jd_captured"
+        logger.warning(
+            "No job description captured for this job; skipping form fill."
         )
-        result.resume_used = profile.resume_path
         return profile
 
     index = _get_resume_index(profile.resumes_dir)
     if not index.entries:
-        result.resume_used = profile.resume_path
+        result.skip_reason = "no_resumes_indexed"
+        logger.warning(
+            "Resume index built from %s is empty (no .docx with a paired "
+            ".pdf?); skipping form fill.",
+            profile.resumes_dir,
+        )
         return profile
 
     should_bid, reasons, details = judge_jd(jd_text, index)
@@ -524,16 +506,16 @@ def _select_resume_for_job(
             joined,
         )
         result.skip_reason = joined
-        result.resume_used = profile.resume_path
         return profile
 
     best, best_score, ranking = match_best_resume(jd_text, index)
     if best is None or best.path is None or best_score <= 0:
-        logger.info(
-            "Resume matcher returned no usable candidate; "
-            "falling back to APPLICANT_RESUME_PATH."
+        result.skip_reason = "no_resume_match"
+        logger.warning(
+            "Resume matcher returned no usable candidate (score=%s); "
+            "skipping form fill.",
+            best_score,
         )
-        result.resume_used = profile.resume_path
         return profile
 
     top_runners = ", ".join(
@@ -547,8 +529,6 @@ def _select_resume_for_job(
     )
     result.resume_used = best.path
 
-    # Re-extract text from the picked resume so the AI grounds answers
-    # in the *new* CV rather than the default resume.pdf.
     picked_text = _extract_resume_text(best.path)
     return dataclasses.replace(
         profile,
@@ -975,21 +955,29 @@ def _fill_greenhouse(
     *,
     submit: bool,
     action_timeout_ms: int,
+    jobright_jd_text: str | None = None,
+    jobright_company_summary: str = "",
+    jobright_role: str = "",
+    jobright_company: str = "",
+    jobright_bid_dir: Path | None = None,
 ) -> AutobidResult:
     result = AutobidResult(provider="greenhouse", url=page.url)
 
     # Capture role + company metadata as early as possible so callers
     # have it for ``applied_jobs.jsonl`` / ``skipped_jobs.jsonl`` even
-    # if the form load times out below.
-    role, slug, company = _extract_role_and_company(page)
-    result.role_title = role
+    # if the form load times out below. When the live runner has
+    # already scraped jobright's detail panel we trust those values
+    # over the page heuristics (the heuristic ``<h1>`` -> "Apply" /
+    # "Back to jobs" path is brittle on some Greenhouse boards).
+    page_role, slug, page_company = _extract_role_and_company(page)
+    result.role_title = jobright_role or page_role
     result.company_slug = slug
-    result.company_name = company
-    if role or company or slug:
+    result.company_name = jobright_company or page_company
+    if result.role_title or result.company_name or slug:
         logger.info(
             "Job metadata: role=%r, company=%r (slug=%r)",
-            role,
-            company,
+            result.role_title,
+            result.company_name,
             slug,
         )
 
@@ -999,35 +987,47 @@ def _fill_greenhouse(
         result.error = "Greenhouse form did not load in time."
         return result
 
-    # 0. Capture the job description -- needed by both the AI answer
-    #    generator AND the per-job resume judge/matcher. We extract the
-    #    JD even when ``ai`` is None, because we still want to save the
-    #    JD to disk and run the BID/SKIP judge.
-    try:
-        jd = _extract_job_description(page)
-    except Exception as exc:
-        logger.debug("Job description extraction failed: %s", exc)
-        jd = ""
-    if jd:
-        logger.info(
-            "Captured %d chars of job description from page.", len(jd)
-        )
+    # 0. Pick the JD source. With the live jobright runner we now use
+    #    the JD text scraped off the jobright detail panel verbatim
+    #    (no truncation) -- it's already authoritative and saved at
+    #    ``bid/jobright/Job_Description.txt``. Older entry points
+    #    (``test_autobid.py``, manual one-off invocations) don't pass
+    #    ``jobright_jd_text`` and fall back to the legacy in-page
+    #    extraction so they keep working unchanged.
+    if jobright_jd_text is not None:
+        jd = jobright_jd_text.strip()
+        # The runner already wrote the JD blob to the bid output dir;
+        # still record where it lives so downstream logs match.
+        if jobright_bid_dir is not None:
+            possible = jobright_bid_dir / "Job_Description.txt"
+            if possible.exists():
+                result.jd_path = possible
+        if jd:
+            logger.info(
+                "Using jobright-scraped JD (%d chars) for judge / matcher / "
+                "AI grounding.",
+                len(jd),
+            )
+        else:
+            logger.info(
+                "Jobright JD was empty; AI will fall back to candidate "
+                "profile + resume only."
+            )
     else:
-        logger.info(
-            "No job description found on page; AI will fall back to "
-            "candidate profile + resume only."
-        )
-
-    # 0a. Save the JD to disk for record-keeping (logs/jds/<company>_<ts>.txt).
-    title_hint = ""
-    if jd:
-        for line in jd.splitlines():
-            if line.strip():
-                title_hint = line.strip()
-                break
-    result.jd_path = _save_job_description(page.url, title_hint, jd)
-    if result.jd_path is not None:
-        logger.info("Saved job description to %s", result.jd_path)
+        try:
+            jd = _extract_job_description(page)
+        except Exception as exc:
+            logger.debug("Job description extraction failed: %s", exc)
+            jd = ""
+        if jd:
+            logger.info(
+                "Captured %d chars of job description from page.", len(jd)
+            )
+        else:
+            logger.info(
+                "No job description found on page; AI will fall back to "
+                "candidate profile + resume only."
+            )
 
     # 0b. Judge whether this job is worth bidding on, and -- if BID --
     #     pick the best-matching resume from APPLICANT_RESUMES_DIR.
@@ -1039,25 +1039,56 @@ def _fill_greenhouse(
         )
         return result
 
-    # 0c. Now that we know which resume we're using, set the AI context.
+    # 0b'. Stage the chosen resume at ``bid/jobright/resume.pdf`` so the
+    #      live runner has a stable, well-known artifact path for the
+    #      job that just won the matcher. The Greenhouse upload below
+    #      then targets that copy instead of the original.
     #
-    # IMPORTANT: ``ai.profile`` was bound ONCE at process startup from
-    # ``APPLICANT_RESUME_PATH`` (i.e. resume.pdf). The per-job matcher
-    # may have just swapped ``profile.resume_text`` to the matched
-    # PDF's text, but unless we re-point ``ai.profile`` at that new
-    # profile, every prompt the AI renders for this job would still
-    # read from the static resume.pdf -- which is exactly the bug
-    # we're fixing here. The ``ai.job_description`` setter clears the
-    # answer cache when the JD changes, so we don't have to worry
-    # about stale cached answers from the old resume.
+    #      We DON'T overwrite ``result.resume_used`` -- the apply log
+    #      needs to show the original PDF name (e.g.
+    #      ``Tyler_Jung_Sr_Software_Engineer(Java,Python,Gen AI,ML,AWS).pdf``)
+    #      so the human can tell which CV was scored highest, not the
+    #      generic ``resume.pdf`` we copy it to.
+    if (
+        jobright_bid_dir is not None
+        and profile.resume_path is not None
+        and profile.resume_path.exists()
+    ):
+        try:
+            staged = _stage_resume_at(profile.resume_path, jobright_bid_dir)
+        except OSError as exc:
+            logger.warning(
+                "Could not copy resume %s to %s: %s",
+                profile.resume_path,
+                jobright_bid_dir,
+                exc,
+            )
+        else:
+            logger.info(
+                "Staged resume %s -> %s for Greenhouse upload.",
+                profile.resume_path.name,
+                staged,
+            )
+            profile = dataclasses.replace(profile, resume_path=staged)
+
+    # 0c. Now that the per-job matcher has swapped in the picked
+    #     resume's path / text, point the AIAnswerer at this profile
+    #     so every prompt is grounded in the matched CV. The
+    #     ``ai.job_description`` and ``ai.company_summary`` setters
+    #     clear the cache when their input changes, so we don't have
+    #     to worry about stale answers from the previous job.
     if ai is not None:
         ai.profile = profile
         ai.job_description = jd
+        ai.company_summary = jobright_company_summary or ""
         if jd:
             logger.info(
                 "AI answers will be tailored to this role and "
-                "grounded in %s.",
+                "grounded in %s%s.",
                 profile.resume_path.name if profile.resume_path else "resume",
+                f" + {len(jobright_company_summary)}-char company summary"
+                if jobright_company_summary
+                else "",
             )
 
     # 1. Resume upload first -- some forms reveal additional fields after a
@@ -1072,12 +1103,19 @@ def _fill_greenhouse(
             result.failed.append(f"Resume/CV ({exc})")
     elif profile.resume_path:
         logger.warning(
-            "APPLICANT_RESUME_PATH points to %s but the file does not exist.",
+            "Matched resume %s no longer exists on disk; resume upload "
+            "will be skipped.",
             profile.resume_path,
         )
         result.skipped.append("Resume/CV (file not found)")
     else:
-        result.skipped.append("Resume/CV (no path configured)")
+        # _select_resume_for_job sets ``skip_reason`` and returns
+        # early when no resume could be picked, so reaching this
+        # branch means the profile somehow lost its resume_path
+        # between the matcher and the form fill -- treat it as a
+        # skip so the caller logs it rather than uploading nothing
+        # silently.
+        result.skipped.append("Resume/CV (no resume picked)")
 
     # 2. SURVEY -- one DOM walk to identify every field that will need
     #    AI input (text answer, dropdown pick, radio pick, checkbox
@@ -1169,6 +1207,23 @@ def _fill_greenhouse(
     # 9. Submit (or dry-run).
     if submit:
         _submit_application(page, result, action_timeout_ms=action_timeout_ms)
+        # If Greenhouse asked for an email-verification code AND the
+        # application actually went through, delete the source email
+        # from the inbox so the user doesn't accumulate one-time code
+        # mails forever. Anything other than a confirmed/verified
+        # submit leaves the email in place so the user can retry by
+        # hand. The delete itself is opt-out via
+        # ``EMAIL_VERIFY_DELETE_ON_SUCCESS`` (handled inside the
+        # ``VerificationEmail`` object).
+        verify_email = result._verification_email
+        if result.submitted and verify_email is not None:
+            try:
+                verify_email.delete()  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.warning(
+                    "Verification-email cleanup raised unexpectedly: %s",
+                    exc,
+                )
     else:
         logger.info(
             "DRY RUN -- form filled but not submitted. Pass --submit to actually submit."
@@ -3385,10 +3440,17 @@ def _handle_security_code_prompt(
     result: AutobidResult,
     action_timeout_ms: int,
 ) -> bool:
-    """Fetch the verification code from Gmail and paste it into the form."""
+    """Fetch the verification code from Gmail and paste it into the form.
+
+    On success, stashes the consumed :class:`VerificationEmail` on
+    ``result._verification_email`` so the caller can delete the
+    source email *after* it has confirmed the application actually
+    submitted -- never before, otherwise a failed submit would lose
+    the code the user might want to retry by hand.
+    """
     from .email_verify import (
         VerifyEmailDisabled,
-        fetch_greenhouse_security_code,
+        fetch_greenhouse_verification_email,
         load_gmail_config,
     )
 
@@ -3407,12 +3469,12 @@ def _handle_security_code_prompt(
         cfg.address,
         timeout_seconds,
     )
-    code = fetch_greenhouse_security_code(
+    email_obj = fetch_greenhouse_verification_email(
         sent_after=sent_after,
         timeout_seconds=timeout_seconds,
         config=cfg,
     )
-    if not code:
+    if email_obj is None:
         msg = (
             "Did not receive a Greenhouse verification email within "
             f"{timeout_seconds:.0f}s. Check your inbox manually."
@@ -3424,7 +3486,7 @@ def _handle_security_code_prompt(
         return False
 
     try:
-        _fill_security_code(page, code, action_timeout_ms=action_timeout_ms)
+        _fill_security_code(page, email_obj.code, action_timeout_ms=action_timeout_ms)
     except Exception as exc:
         msg = f"Could not paste verification code into the form: {exc}"
         result.submission_status = "needs_code_failed"
@@ -3432,6 +3494,9 @@ def _handle_security_code_prompt(
         result.error = msg
         logger.error(msg)
         return False
+    # Hand the email object up to the caller; it's only deleted
+    # after the surrounding submit-and-confirm dance succeeds.
+    result._verification_email = email_obj
     logger.info("Pasted verification code into the security-code field.")
     return True
 
