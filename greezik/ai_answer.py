@@ -21,6 +21,38 @@ from .profile import ApplicantProfile
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Pricing table for cost estimation
+# ---------------------------------------------------------------------------
+
+# (input $/1M tokens, output $/1M tokens) — standard tier, April 2026.
+# Keys are matched by prefix (longest first) so versioned names like
+# "gpt-4o-mini-2024-07-18" resolve to the right row.
+_MODEL_PRICE_PER_1M: dict[str, tuple[float, float]] = {
+    "gpt-5.5":       (5.00,  30.00),
+    "gpt-5.4-mini":  (0.75,   4.50),
+    "gpt-5.4-nano":  (0.20,   1.25),
+    "gpt-5.4":       (2.50,  15.00),
+    "gpt-4o-mini":   (0.15,   0.60),
+    "gpt-4o":        (2.50,  10.00),
+    "gpt-4-turbo":  (10.00,  30.00),
+    "gpt-3.5-turbo": (0.50,   1.50),
+}
+
+
+def _model_price(model: str) -> tuple[float, float]:
+    """Return ``(input $/1M, output $/1M)`` for *model*, matched by prefix.
+
+    Falls back to ``(0.0, 0.0)`` for unknown models so cost is reported
+    as 0 rather than raising.
+    """
+    lc = model.lower()
+    for key in sorted(_MODEL_PRICE_PER_1M, key=len, reverse=True):
+        if lc.startswith(key):
+            return _MODEL_PRICE_PER_1M[key]
+    return (0.0, 0.0)
+
+
 # The three "kinds" of question the autobid can ask the AI. Used both
 # for caching and for telling the batch endpoint how to shape its reply
 # (string vs single option vs list of options).
@@ -83,6 +115,10 @@ class AIAnswerer:
         # logged at end-of-job so the user can see the savings.
         self.api_calls = 0
         self.cache_hits = 0
+        # Raw token counts accumulated across all API calls for this job.
+        # Used to compute per-job cost.
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
         # Distinct cache keys that were actually consumed during fill --
         # i.e. unique questions answered without a per-question API call.
         # Useful for reporting "saved N API calls" in a way that doesn't
@@ -99,6 +135,16 @@ class AIAnswerer:
         # answers reflect the employer's mission / domain. Like
         # ``job_description``, changing it clears the cache.
         self._company_summary: str = ""
+
+    @property
+    def cost_usd(self) -> float:
+        """Estimated API spend for this job based on accumulated token counts.
+
+        Uses the standard-tier price table in :data:`_MODEL_PRICE_PER_1M`.
+        Returns 0.0 for unknown models rather than raising.
+        """
+        price_in, price_out = _model_price(self.model)
+        return (self.input_tokens * price_in + self.output_tokens * price_out) / 1_000_000
 
     @property
     def profile(self) -> ApplicantProfile:
@@ -125,6 +171,8 @@ class AIAnswerer:
             self.distinct_served.clear()
             self.api_calls = 0
             self.cache_hits = 0
+            self.input_tokens = 0
+            self.output_tokens = 0
         self._profile = value
 
     @property
@@ -144,6 +192,8 @@ class AIAnswerer:
             self.distinct_served.clear()
             self.api_calls = 0
             self.cache_hits = 0
+            self.input_tokens = 0
+            self.output_tokens = 0
         self._job_description = new_value
 
     @property
@@ -162,6 +212,8 @@ class AIAnswerer:
         if new_value != self._company_summary:
             self._cache.clear()
             self.distinct_served.clear()
+            self.input_tokens = 0
+            self.output_tokens = 0
         self._company_summary = new_value
 
     @classmethod
@@ -334,12 +386,16 @@ class AIAnswerer:
 
         try:
             self.api_calls += 1
-            raw = self._client.chat.completions.create(
+            response = self._client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
                 response_format={"type": "json_object"},
-            ).choices[0].message.content or ""
+            )
+            if response.usage:
+                self.input_tokens += response.usage.prompt_tokens or 0
+                self.output_tokens += response.usage.completion_tokens or 0
+            raw = response.choices[0].message.content or ""
         except Exception as exc:  # network / auth / rate-limit / model
             logger.warning(
                 "Batch AI call failed (%s); will fall back to per-question API calls.",
@@ -477,6 +533,9 @@ class AIAnswerer:
         except Exception as exc:  # network / auth / rate-limit -- non-fatal
             logger.warning("AI call failed for question %r: %s", label, exc)
             return None
+        if response.usage:
+            self.input_tokens += response.usage.prompt_tokens or 0
+            self.output_tokens += response.usage.completion_tokens or 0
         text = (response.choices[0].message.content or "").strip().strip('"').strip()
         if not text:
             logger.warning("AI returned empty answer for question %r.", label)

@@ -507,6 +507,19 @@ def _handle_popup_for_url(
     company = result.company_name or company_hint
     slug = result.company_slug or early_slug
 
+    # Snapshot AI usage BEFORE the next job resets the counters (the
+    # job_description setter on AIAnswerer clears them at the start of
+    # the next autobid_apply call).
+    ai_extra: dict = {}
+    if ai is not None and (ai.api_calls or ai.input_tokens):
+        ai_extra = {
+            "ai_model": ai.model,
+            "ai_api_calls": ai.api_calls,
+            "ai_input_tokens": ai.input_tokens,
+            "ai_output_tokens": ai.output_tokens,
+            "ai_cost_usd": round(ai.cost_usd, 6),
+        }
+
     # 2. Judge SKIP (low fit, blacklisted role, etc.).
     if result.skip_reason is not None:
         reason = f"judge_skip: {result.skip_reason}"
@@ -540,6 +553,7 @@ def _handle_popup_for_url(
             resume_used=(
                 result.resume_used.name if result.resume_used else ""
             ),
+            extra=ai_extra or None,
         )
         return _PopupOutcome(
             kind="applied",
@@ -562,6 +576,7 @@ def _handle_popup_for_url(
             resume_used=(
                 result.resume_used.name if result.resume_used else ""
             ),
+            extra=ai_extra or None,
         )
         return _PopupOutcome(
             kind="applied",
@@ -620,6 +635,7 @@ def _handle_popup_for_url(
             resume_used=(
                 result.resume_used.name if result.resume_used else ""
             ),
+            extra=ai_extra or None,
         )
         return _PopupOutcome(
             kind="manual_applied",
